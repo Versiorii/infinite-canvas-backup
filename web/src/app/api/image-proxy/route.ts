@@ -1,0 +1,61 @@
+import type { NextRequest } from "next/server";
+
+export const runtime = "nodejs";
+export const maxDuration = 300;
+
+const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
+
+// internalImageHosts maps internal/loopback hostnames to the docker0 gateway
+// address that the chatgpt2api container is reachable at from inside the
+// infinite-canvas container. When the frontend passes an image URL whose host
+// is one of these internal addresses, we rewrite it so the server-side fetch
+// can actually reach the image file.
+// Map internal/loopback addresses to the docker0 gateway so the
+// server-side fetch can reach image files served by sibling containers.
+const internalImageHostRewrites: Record<string, string> = {
+	"127.0.0.1":      "172.17.0.1",
+	"localhost":      "172.17.0.1",
+	"[::1]":          "172.17.0.1",
+};
+
+function rewriteInternalImageUrl(url: URL) {
+	const targetHost = internalImageHostRewrites[url.hostname];
+	if (targetHost && url.port === "3000") {
+		url.hostname = targetHost;
+	}
+	return url;
+}
+
+export async function GET(request: NextRequest) {
+    const rawUrl = request.nextUrl.searchParams.get("url") || "";
+    let url: URL;
+    try {
+        url = new URL(rawUrl);
+    } catch {
+        return Response.json({ code: 1, data: null, msg: "图片地址无效" }, { status: 400 });
+    }
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+        return Response.json({ code: 1, data: null, msg: "图片地址无效" }, { status: 400 });
+    }
+    url = rewriteInternalImageUrl(url);
+
+    try {
+        const response = await fetch(url, { redirect: "follow" });
+        if (!response.ok || !response.body) {
+            return Response.json({ code: 1, data: null, msg: `图片下载失败：${response.status}` }, { status: 502 });
+        }
+        const contentType = response.headers.get("content-type") || "application/octet-stream";
+        if (!contentType.startsWith("image/")) {
+            return Response.json({ code: 1, data: null, msg: "远程内容不是图片" }, { status: 502 });
+        }
+        const contentLength = Number(response.headers.get("content-length") || 0);
+        if (contentLength > MAX_IMAGE_BYTES) {
+            return Response.json({ code: 1, data: null, msg: "图片过大" }, { status: 502 });
+        }
+        const headers = new Headers({ "content-type": contentType, "cache-control": "public, max-age=86400" });
+        return new Response(response.body, { status: 200, headers });
+    } catch (error) {
+        console.error("Failed to proxy image", url.toString(), error);
+        return Response.json({ code: 1, data: null, msg: "图片代理请求失败" }, { status: 502 });
+    }
+}
